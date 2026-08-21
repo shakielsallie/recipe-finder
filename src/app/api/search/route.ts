@@ -3,7 +3,9 @@ import { Recipe } from '@/types/recipe';
 import { parseRecipes } from '@/lib/recipeParse';
 
 const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').replace(/^﻿/, '').trim();
-const GROQ_MODEL = 'llama-3.1-8b-instant';
+// Overridable from the Vercel dashboard so a decommissioned model is a config
+// change, not a redeploy. llama-3.1-8b-instant was retired and 404s.
+const GROQ_MODEL = (process.env.GROQ_MODEL || '').trim() || 'openai/gpt-oss-20b';
 const TAVILY_API_KEY = (process.env.TAVILY_API_KEY || '').replace(/^﻿/, '').trim();
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -21,11 +23,16 @@ async function groqGenerate(prompt: string): Promise<GroqCompletion> {
       body: JSON.stringify({
         model: GROQ_MODEL,
         messages: [{ role: 'user', content: prompt }],
-        // Five recipes with full ingredient and instruction lists overflow a small
-        // budget, and a truncated completion is unparseable JSON.
-        max_tokens: 8000,
+        // Groq counts reserved max_tokens against the 8000 tokens-per-minute
+        // limit, so this stays around twice what five recipes actually need
+        // (~1000). The parser salvages whatever completes if it runs over.
+        max_tokens: 3000,
         temperature: 0.2,
         response_format: { type: 'json_object' },
+        // gpt-oss spends completion tokens on reasoning before it writes any
+        // JSON; keeping that short leaves the budget for actual recipes and
+        // roughly halves the response. Other models reject the parameter.
+        ...(GROQ_MODEL.includes('gpt-oss') ? { reasoning_effort: 'low' } : {}),
       }),
     });
 
