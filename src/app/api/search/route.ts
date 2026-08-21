@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { Recipe } from '@/types/recipe';
+import { parseRecipes } from '@/lib/recipeParse';
 
 const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').replace(/^﻿/, '').trim();
 const GROQ_MODEL = 'llama-3.1-8b-instant';
@@ -7,7 +8,9 @@ const TAVILY_API_KEY = (process.env.TAVILY_API_KEY || '').replace(/^﻿/, '').tr
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function groqGenerate(prompt: string): Promise<string> {
+type GroqCompletion = { content: string; truncated: boolean };
+
+async function groqGenerate(prompt: string): Promise<GroqCompletion> {
   for (let attempt = 0; attempt < 3; attempt++) {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -18,7 +21,11 @@ async function groqGenerate(prompt: string): Promise<string> {
       body: JSON.stringify({
         model: GROQ_MODEL,
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: 2048,
+        // Five recipes with full ingredient and instruction lists overflow a small
+        // budget, and a truncated completion is unparseable JSON.
+        max_tokens: 8000,
+        temperature: 0.2,
+        response_format: { type: 'json_object' },
       }),
     });
 
@@ -27,10 +34,18 @@ async function groqGenerate(prompt: string): Promise<string> {
       throw new Error('rate_limit');
     }
 
-    if (!res.ok) throw new Error(`Groq responded with ${res.status}`);
+    if (!res.ok) {
+      const detail = (await res.text().catch(() => '')).slice(0, 300);
+      throw new Error(`Groq responded with ${res.status}${detail ? `: ${detail}` : ''}`);
+    }
 
     const data = await res.json();
-    return (data.choices[0].message.content as string).trim();
+    const choice = data?.choices?.[0];
+    const content = choice?.message?.content;
+    if (typeof content !== 'string' || !content.trim()) {
+      throw new Error('Groq returned an empty completion');
+    }
+    return { content: content.trim(), truncated: choice.finish_reason === 'length' };
   }
   throw new Error('rate_limit');
 }
@@ -55,7 +70,9 @@ async function searchTavily(query: string): Promise<SearchResult[]> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (data.results ?? []).map((r: any) => ({
     title: r.title ?? '',
-    description: (r.content ?? '').slice(0, 200),
+    // A longer snippet gives the model real ingredient text to quote instead of
+    // inventing it, which keeps the completion shorter and more accurate.
+    description: (r.content ?? '').slice(0, 600),
     url: r.url ?? '',
   }));
 }
@@ -66,21 +83,28 @@ async function extractRecipes(results: SearchResult[]): Promise<Recipe[]> {
     .join('\n\n');
 
   const prompt =
-    `Extract recipe information from the following search results and return a JSON array. ` +
-    `Each item must have: title (string), ingredients (array of strings), instructions (array of strings), ` +
-    `cookTime (string), source (the URL string). ` +
+    `Extract recipe information from the following search results. ` +
+    `Respond with a JSON object of the form {"recipes": [...]}. ` +
+    `Each item in "recipes" must have: title (string), ingredients (array of strings), ` +
+    `instructions (array of strings), cookTime (string), source (the URL string, copied exactly). ` +
     `If ingredients or instructions are not in the snippet, infer reasonable ones from the recipe title. ` +
-    `Return ONLY a valid JSON array — no markdown, no explanation.\n\nResults:\n\n${resultsText}`;
+    `Keep each recipe to at most 12 ingredients and 8 instruction steps. ` +
+    `Return ONLY the JSON object — no markdown, no explanation.\n\nResults:\n\n${resultsText}`;
 
-  const response = await groqGenerate(prompt);
+  const { content, truncated } = await groqGenerate(prompt);
 
-  const jsonMatch = response.match(/\[[\s\S]*\]/);
-  if (!jsonMatch) throw new Error('No JSON array in Groq response');
+  const sources = results.map((r) => r.url).filter(Boolean);
+  const recipes = parseRecipes(content, sources);
 
-  const parsed: Recipe[] = JSON.parse(jsonMatch[0]);
-  return parsed.filter(
-    (r) => r.title && Array.isArray(r.ingredients) && Array.isArray(r.instructions),
-  );
+  if (recipes.length === 0) {
+    throw new Error(
+      truncated
+        ? 'Groq response hit the token limit before any complete recipe'
+        : `Could not parse recipes from Groq response: ${content.slice(0, 200)}`,
+    );
+  }
+
+  return recipes;
 }
 
 export async function POST(req: NextRequest) {
@@ -131,12 +155,23 @@ export async function POST(req: NextRequest) {
           { status: 429 },
         );
       }
+      console.error('[search] recipe extraction failed:', msg);
       try {
         recipes = await extractRecipes(searchResults.slice(0, 3));
-      } catch {
-        return NextResponse.json(
-          { recipes: [], warning: 'Results found but could not extract structured recipe data.' },
-        );
+      } catch (retryErr) {
+        const retryMsg = retryErr instanceof Error ? retryErr.message : '';
+        if (retryMsg === 'rate_limit') {
+          return NextResponse.json(
+            { error: 'Too many requests — please wait a few seconds and try again.' },
+            { status: 429 },
+          );
+        }
+        console.error('[search] retry failed:', retryMsg);
+        return NextResponse.json({
+          recipes: [],
+          warning: 'Results found but could not extract structured recipe data.',
+          detail: retryMsg,
+        });
       }
     }
 
